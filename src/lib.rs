@@ -6,7 +6,6 @@
 use heapless_bytes::Bytes;
 use num_bigint_dig::traits::ModInverse;
 use num_bigint_dig::BigUint;
-use rsa::rand_core::{CryptoRng, RngCore};
 use rsa::sha2::{Sha256, Sha384, Sha512};
 use rsa::{
     pkcs1v15::SigningKey,
@@ -326,12 +325,11 @@ fn decrypt(
 }
 
 #[cfg(feature = "raw")]
-fn rsa_raw<R: RngCore + CryptoRng, const N: usize>(
+fn rsa_raw<const N: usize>(
     keystore: &mut impl Keystore,
     key_id: KeyId,
     plaintext: &Message,
     kind: key::Kind,
-    rng: &mut R,
 ) -> Result<Bytes<N>, Error> {
     let priv_key_der = keystore
         .load_key(key::Secrecy::Secret, Some(kind), &key_id)
@@ -341,7 +339,7 @@ fn rsa_raw<R: RngCore + CryptoRng, const N: usize>(
         .expect("Failed to deserialize an RSA private key from PKCS#8 DER");
 
     let c = rsa::BigUint::from_bytes_be(plaintext);
-    let res = rsa::internals::decrypt(Some(rng), &priv_key, &c).map_err(|_err| {
+    let res = rsa::internals::decrypt(Some(keystore.rng()), &priv_key, &c).map_err(|_err| {
         error!("Failed raw decryption: {:?}", _err);
         Error::InternalError
     })?;
@@ -353,12 +351,11 @@ fn rsa_raw<R: RngCore + CryptoRng, const N: usize>(
 }
 
 #[cfg(not(feature = "raw"))]
-fn rsa_raw<R: RngCore + CryptoRng, const N: usize>(
+fn rsa_raw<const N: usize>(
     _keystore: &mut impl Keystore,
     _key: KeyId,
     _plaintext: &Message,
     _kind: key::Kind,
-    _rng: &mut R,
 ) -> Result<Bytes<N>, Error> {
     warn!("Raw RSA is not enabled. Please enable the `raw` feature");
     Err(Error::FunctionNotSupported)
@@ -438,32 +435,45 @@ impl Backend for SoftwareRsa {
         request: &Request,
         resources: &mut ServiceResources<P>,
     ) -> Result<Reply, Error> {
-        let mut rng = resources.rng()?;
-        let mut keystore = resources.keystore(core_ctx.path.clone())?;
+        // Used to ensure that the keystore is only created once.
+        // Keystore creation is expensive because it forks the rng.
+        let assert_once: [Request; 0] = [];
+        let keystore = move |resources: &mut ServiceResources<P>, core_ctx: &mut CoreContext| {
+            drop(assert_once);
+            resources.keystore(core_ctx.path.clone())
+        };
         match request {
             Request::DeriveKey(req) => {
                 let (_bits, kind, _) = bits_and_kind_from_mechanism(req.mechanism)?;
-                derive_key(&mut keystore, req, kind).map(Reply::DeriveKey)
+                derive_key(&mut keystore(resources, core_ctx)?, req, kind).map(Reply::DeriveKey)
             }
             Request::DeserializeKey(req) => {
                 let (bits, kind, _) = bits_and_kind_from_mechanism(req.mechanism)?;
-                deserialize_key(&mut keystore, req, bits, kind).map(Reply::DeserializeKey)
+                deserialize_key(&mut keystore(resources, core_ctx)?, req, bits, kind)
+                    .map(Reply::DeserializeKey)
             }
             Request::SerializeKey(req) => {
                 let (_bits, kind, _) = bits_and_kind_from_mechanism(req.mechanism)?;
-                serialize_key(&mut keystore, req, kind).map(Reply::SerializeKey)
+                serialize_key(&mut keystore(resources, core_ctx)?, req, kind)
+                    .map(Reply::SerializeKey)
             }
             Request::GenerateKey(req) => {
                 let (bits, kind, _) = bits_and_kind_from_mechanism(req.mechanism)?;
-                generate_key(&mut keystore, req, bits, kind).map(Reply::GenerateKey)
+                generate_key(&mut keystore(resources, core_ctx)?, req, bits, kind)
+                    .map(Reply::GenerateKey)
             }
             Request::Sign(req) => {
                 let (_bits, kind, raw) = bits_and_kind_from_mechanism(req.mechanism)?;
                 if raw {
-                    rsa_raw(&mut keystore, req.key, &req.message, kind, &mut rng)
-                        .map(|d| Reply::Sign(reply::Sign { signature: d }))
+                    rsa_raw(
+                        &mut keystore(resources, core_ctx)?,
+                        req.key,
+                        &req.message,
+                        kind,
+                    )
+                    .map(|d| Reply::Sign(reply::Sign { signature: d }))
                 } else {
-                    sign(&mut keystore, req, kind).map(Reply::Sign)
+                    sign(&mut keystore(resources, core_ctx)?, req, kind).map(Reply::Sign)
                 }
             }
             Request::Verify(req) => {
@@ -472,24 +482,30 @@ impl Backend for SoftwareRsa {
                     warn!("Attempt at raw verify");
                     return Err(Error::MechanismInvalid);
                 }
-                verify(&mut keystore, req, bits, kind).map(Reply::Verify)
+                verify(&mut keystore(resources, core_ctx)?, req, bits, kind).map(Reply::Verify)
             }
             Request::Decrypt(req) => {
                 let (_bits, kind, raw) = bits_and_kind_from_mechanism(req.mechanism)?;
                 if raw {
-                    rsa_raw(&mut keystore, req.key, &req.message, kind, &mut rng)
-                        .map(|r| Reply::Decrypt(reply::Decrypt { plaintext: Some(r) }))
+                    rsa_raw(
+                        &mut keystore(resources, core_ctx)?,
+                        req.key,
+                        &req.message,
+                        kind,
+                    )
+                    .map(|r| Reply::Decrypt(reply::Decrypt { plaintext: Some(r) }))
                 } else {
-                    decrypt(&mut keystore, req, kind).map(Reply::Decrypt)
+                    decrypt(&mut keystore(resources, core_ctx)?, req, kind).map(Reply::Decrypt)
                 }
             }
             Request::UnsafeInjectKey(req) => {
                 let (bits, kind, _) = bits_and_kind_from_mechanism(req.mechanism)?;
-                unsafe_inject_key(&mut keystore, req, bits, kind).map(Reply::UnsafeInjectKey)
+                unsafe_inject_key(&mut keystore(resources, core_ctx)?, req, bits, kind)
+                    .map(Reply::UnsafeInjectKey)
             }
             Request::Exists(req) => {
                 let (_bits, kind, _) = bits_and_kind_from_mechanism(req.mechanism)?;
-                exists(&mut keystore, req, kind).map(Reply::Exists)
+                exists(&mut keystore(resources, core_ctx)?, req, kind).map(Reply::Exists)
             }
             _ => Err(Error::RequestNotAvailable),
         }
